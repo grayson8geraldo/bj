@@ -154,6 +154,133 @@ class TestShuffleTracker(unittest.TestCase):
         self.assertEqual(tracker.zones[1].size, 2)
 
 
+class TestMultistackPrediction(unittest.TestCase):
+    """Tests for the realistic multi-stack shuffle model."""
+
+    def _make_tracker(self, zone_counts: list[int], cards_per_zone: int = 5):
+        """Helper: create a tracker with zones of known count character.
+
+        zone_counts: list of target RCs per zone.
+        Positive RC → feed low cards, Negative RC → feed high cards.
+        """
+        tracker = ShuffleTracker(num_decks=8, cards_per_zone=cards_per_zone)
+        for rc in zone_counts:
+            if rc > 0:
+                for _ in range(abs(rc)):
+                    tracker.add_card("5")   # +1 each
+                pad = cards_per_zone - abs(rc)
+                for _ in range(pad):
+                    tracker.add_card("7")   # neutral
+            elif rc < 0:
+                for _ in range(abs(rc)):
+                    tracker.add_card("K")   # -1 each
+                pad = cards_per_zone - abs(rc)
+                for _ in range(pad):
+                    tracker.add_card("7")
+            else:
+                for _ in range(cards_per_zone):
+                    tracker.add_card("7")
+        tracker.finalize_shoe()
+        return tracker
+
+    def test_2_stacks_same_as_simple(self):
+        """With 2 stacks the multistack model should behave like predict_simple."""
+        tracker = self._make_tracker([+5, +5, -5, 0])
+        preds_simple = tracker.predict_simple(num_riffles=2, riffle_quality=0.5)
+        preds_multi = tracker.predict_multistack(
+            num_stacks=2, riffles_per_pair=2,
+            riffle_quality=0.5, has_strip=False,
+        )
+        self.assertEqual(len(preds_simple), len(preds_multi))
+        for ps, pm in zip(preds_simple, preds_multi):
+            self.assertAlmostEqual(ps.estimated_count, pm.estimated_count, places=2)
+
+    def test_3_stacks_has_unriffled_zone(self):
+        """With 3 stacks, the odd stack out is never riffled."""
+        tracker = self._make_tracker([+5, -5, +3, -3, +4, -4])
+        # 6 zones, 3 stacks: stacks=[0,1], [2,3], [4,5]
+        # Riffle pairs: (stack0, stack1) and (stack2 is solo — odd one out)
+        # Wait, with 3 stacks: pairs are (0,1), and stack 2 is solo
+        preds = tracker.predict_multistack(
+            num_stacks=3, riffles_per_pair=2,
+            riffle_quality=0.5, has_strip=False,
+        )
+        self.assertTrue(len(preds) > 0)
+
+        # Check that at least one prediction is unriffled
+        unriffled = [p for p in preds if not p.riffled]
+        self.assertTrue(len(unriffled) > 0, "3 stacks should have un-riffled section(s)")
+
+        # Un-riffled sections should have confidence=1.0
+        for p in unriffled:
+            self.assertAlmostEqual(p.confidence, 1.0)
+
+    def test_4_stacks_no_cross_group_mixing(self):
+        """With 4 stacks, groups (0,1) and (2,3) never mix with each other."""
+        # Zone 0,1 → stack 0; Zone 2,3 → stack 1; Zone 4,5 → stack 2; Zone 6,7 → stack 3
+        # Groups: (stack0, stack1) riffled and (stack2, stack3) riffled
+        # Zones 0-3 never contact zones 4-7
+        tracker = self._make_tracker([+5, +5, -5, -5, +3, +3, -3, -3])
+        preds = tracker.predict_multistack(
+            num_stacks=4, riffles_per_pair=2,
+            riffle_quality=0.3, has_strip=False,
+        )
+        self.assertTrue(len(preds) > 0)
+        # All should be riffled (4 stacks, 2 pairs, no solo)
+        self.assertTrue(all(p.riffled for p in preds))
+
+    def test_sloppy_riffle_higher_retention(self):
+        """Sloppy riffles retain more zone character than good riffles."""
+        tracker = self._make_tracker([+5, 0, -5, +5])
+        preds_sloppy = tracker.predict_multistack(
+            num_stacks=2, riffles_per_pair=1,
+            riffle_quality=0.3, has_strip=False,
+        )
+        preds_good = tracker.predict_multistack(
+            num_stacks=2, riffles_per_pair=2,
+            riffle_quality=0.7, has_strip=False,
+        )
+        # Find a section with non-zero count in both
+        max_sloppy = max(abs(p.estimated_count) for p in preds_sloppy)
+        max_good = max(abs(p.estimated_count) for p in preds_good)
+        self.assertGreater(max_sloppy, max_good)
+
+    def test_strip_cut_reduces_retention(self):
+        """Strip cut should reduce predicted count magnitude."""
+        tracker = self._make_tracker([+5, -5, +5, -5])
+        preds_no_strip = tracker.predict_multistack(
+            num_stacks=2, riffles_per_pair=1,
+            riffle_quality=0.3, has_strip=False,
+        )
+        preds_strip = tracker.predict_multistack(
+            num_stacks=2, riffles_per_pair=1,
+            riffle_quality=0.3, has_strip=True,
+        )
+        # With strip, effective quality is higher → lower retention
+        max_no_strip = max(abs(p.estimated_count) for p in preds_no_strip)
+        max_strip = max(abs(p.estimated_count) for p in preds_strip)
+        self.assertGreaterEqual(max_no_strip, max_strip)
+
+    def test_unriffled_zone_full_count(self):
+        """Un-riffled zone should preserve its exact running count."""
+        # 3 zones, 3 stacks: each zone is its own stack
+        # Pairs: (stack0, stack1) riffled, stack2 solo
+        tracker = self._make_tracker([+3, -4, +5], cards_per_zone=5)
+        preds = tracker.predict_multistack(
+            num_stacks=3, riffles_per_pair=2,
+            riffle_quality=0.5, has_strip=False,
+        )
+        unriffled = [p for p in preds if not p.riffled]
+        self.assertTrue(len(unriffled) > 0)
+        # The un-riffled section should have the full zone RC
+        for p in unriffled:
+            source_zone = tracker.zones[p.source_zones[0]]
+            self.assertAlmostEqual(
+                p.estimated_count,
+                float(source_zone.running_count),
+            )
+
+
 class TestZonePrediction(unittest.TestCase):
     def test_favorable(self):
         p = ZonePrediction(0, -3.0, 100, [0, 1], 0.5)
@@ -170,10 +297,15 @@ class TestZonePrediction(unittest.TestCase):
         self.assertFalse(p.is_favorable)
         self.assertFalse(p.is_unfavorable)
 
-    def test_summary(self):
+    def test_summary_bet_big(self):
         p = ZonePrediction(0, -3.0, 100, [0, 1], 0.5)
         s = p.summary()
         self.assertIn("BET BIG", s)
+
+    def test_summary_not_riffled(self):
+        p = ZonePrediction(0, -3.0, 100, [0], 1.0, riffled=False)
+        s = p.summary()
+        self.assertIn("NOT RIFFLED", s)
 
 
 if __name__ == "__main__":

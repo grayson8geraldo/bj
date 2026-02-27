@@ -1,17 +1,26 @@
-"""Shuffle Tracking for hand-shuffled shoes.
+"""Shuffle Tracking for hand-shuffled 6/8-deck shoes.
 
-When a dealer uses riffle shuffles, cards are not fully randomized.
-Zones of high/low count cards maintain partial structure through the shuffle.
+When a dealer hand-shuffles a multi-deck shoe with riffle shuffles,
+cards are NOT fully randomized.  A dealer cannot riffle 416 cards
+at once — they split the discard tray into 2–4 stacks, riffle pairs
+of stacks together, and reassemble.  This means:
+
+  • Zones within the same riffle group are partially mixed
+  • Zones in DIFFERENT groups that never contact each other
+    retain 100% of their count character
 
 Technique:
 1. Divide the dealt shoe into ZONES (segments of ~1 deck each)
 2. Track the running count of EACH zone separately
-3. Observe the dealer's shuffle routine (how zones are interleaved)
-4. After the shuffle, predict which sections of the new shoe are
-   "ten-rich" (favorable) or "ten-poor" (unfavorable)
-5. Bet big when playing through a predicted favorable zone
+3. Observe the dealer's shuffle routine:
+   - How many stacks?  Which zones go into which stack?
+   - How many riffles per pair?  How sloppy?
+4. Map zones through the shuffle to predict which sections of
+   the new shoe are ten-rich (favorable) or ten-poor (unfavorable)
+5. Bet big when playing through a predicted favorable section
 
-This module implements zone tracking and riffle shuffle mapping.
+This module implements zone tracking and realistic multi-stack
+riffle shuffle mapping.
 """
 
 from __future__ import annotations
@@ -199,92 +208,164 @@ class ShuffleTracker:
         step = ShuffleStep(step_type="cut", details=details)
         self.shuffle_procedure.append(step)
 
-    # ── Simple prediction model ──────────────────────────
-    # For practical use: map zone counts through a standard
-    # riffle-riffle-strip-cut procedure
+    # ── Prediction models ──────────────────────────────────
 
     def predict_simple(self, num_riffles: int = 2,
                        riffle_quality: float = 0.5) -> list["ZonePrediction"]:
-        """Generate predictions for the new shoe using a simple model.
+        """Simple model — splits all zones in half and riffles once.
 
-        Assumes a standard shuffle: the discard tray is split roughly
-        in half, riffled together N times, then stripped and cut.
+        Kept for backward compatibility and small-shoe scenarios.
+        For 6/8-deck hand shuffles use predict_multistack().
+        """
+        if not self.zones or len(self.zones) < 2:
+            return []
+        mid = len(self.zones) // 2
+        groups = [
+            (list(range(mid)), list(range(mid, len(self.zones)))),
+        ]
+        return self._predict_from_groups(groups, num_riffles, riffle_quality)
 
-        After each riffle, zone character is retained by (1-quality) factor.
-        After N riffles: retention = (1-quality)^N
+    def predict_multistack(
+        self,
+        num_stacks: int = 2,
+        riffles_per_pair: int = 2,
+        riffle_quality: float = 0.5,
+        has_strip: bool = True,
+    ) -> list["ZonePrediction"]:
+        """Realistic model for hand-shuffled 6/8-deck shoes.
+
+        The dealer splits the discard tray into `num_stacks` stacks
+        (~1-2 decks each), then riffles adjacent pairs together.
+
+        Key insight: zones in stacks that are NEVER riffled together
+        retain 100% of their count character — only riffled pairs mix.
+
+        Procedure modeled:
+            1. Discard tray split into num_stacks stacks
+               Stack 0 = bottom (zones dealt first)
+               Stack K = top   (zones dealt last)
+            2. Adjacent pairs riffled: (0,1), (2,3), ...
+               If odd number of stacks, the last stack is un-riffled
+            3. Optional strip cut (reduces retention by ~20%)
+            4. Cut card placed
 
         Args:
-            num_riffles: Number of riffle passes (typically 1-3).
-            riffle_quality: 0.0 (no mixing) to 1.0 (perfect). 0.5 is average.
+            num_stacks:      How many piles the dealer splits into (2-4)
+            riffles_per_pair: Riffles per pair (typically 1-3)
+            riffle_quality:  0.0 (sloppy) to 1.0 (perfect). 0.3-0.5 typical.
+            has_strip:       Did the dealer do a strip cut after riffling?
 
         Returns:
-            List of predictions for sections of the new shoe.
+            Predictions for each section of the new shoe.
         """
-        if not self.zones:
+        if not self.zones or len(self.zones) < 2:
             return []
-
-        model = RiffleModel(riffle_quality)
-        retention = model.retention ** num_riffles
 
         n = len(self.zones)
-        if n < 2:
-            return []
+        num_stacks = max(2, min(num_stacks, n))  # clamp
 
-        # Split zones into top/bottom halves (as they sit in discard tray)
-        # Discard tray: zone 0 is at bottom (dealt first), zone N at top
-        mid = n // 2
-        bottom_half = self.zones[:mid]   # zones 0..mid-1
-        top_half = self.zones[mid:]      # zones mid..N-1
+        # ── Split zones into stacks ──
+        # Distribute zones as evenly as possible across stacks
+        stacks: list[list[int]] = [[] for _ in range(num_stacks)]
+        for i, zone in enumerate(self.zones):
+            stack_idx = min(i * num_stacks // n, num_stacks - 1)
+            stacks[stack_idx].append(zone.index)
 
-        # After riffle: top and bottom interleave
-        # The resulting shoe sections inherit blended counts
-        predictions = []
+        # ── Pair adjacent stacks for riffling ──
+        # (0,1), (2,3), ... — zones across non-adjacent stacks NEVER mix
+        groups: list[tuple[list[int], list[int]]] = []
+        i = 0
+        while i < len(stacks) - 1:
+            groups.append((stacks[i], stacks[i + 1]))
+            i += 2
+        # Odd stack out — never riffled, full retention
+        if len(stacks) % 2 == 1:
+            groups.append((stacks[-1], []))  # solo group
 
-        # Model: new shoe has sections where adjacent top/bottom zones merged
-        # Each pair creates a section in the new shoe
-        max_pairs = min(len(top_half), len(bottom_half))
+        # Strip cut reduces retention by ~20%
+        quality = riffle_quality
+        if has_strip:
+            quality = min(quality + 0.1, 1.0)
 
-        for i in range(max_pairs):
-            tz = top_half[i]
-            bz = bottom_half[i]
+        return self._predict_from_groups(groups, riffles_per_pair, quality)
 
-            # Blended count after interleaving
-            combined_rc = (tz.running_count + bz.running_count)
-            combined_size = tz.size + bz.size
+    def _predict_from_groups(
+        self,
+        groups: list[tuple[list[int], list[int]]],
+        num_riffles: int,
+        riffle_quality: float,
+    ) -> list["ZonePrediction"]:
+        """Core prediction engine: map riffle groups to predictions.
 
-            # Apply retention factor — only partial structure survives
-            effective_rc = combined_rc * retention
+        Each group is a pair of zone-index lists that get riffled together.
+        Within a group, zone counts blend with retention factor.
+        Solo groups (second list empty) pass through with full retention.
+        """
+        model = RiffleModel(riffle_quality)
+        retention = model.retention ** num_riffles
+        predictions: list[ZonePrediction] = []
+        section_idx = 0
 
-            pred = ZonePrediction(
-                section_index=i,
-                estimated_count=effective_rc,
-                estimated_cards=combined_size,
-                source_zones=[tz.index, bz.index],
-                confidence=retention,
-            )
-            predictions.append(pred)
+        for left_indices, right_indices in groups:
+            left_zones = [self.zones[i] for i in left_indices]
+            right_zones = [self.zones[i] for i in right_indices]
 
-        # Handle leftover zone if odd number
-        if len(top_half) > len(bottom_half):
-            extra = top_half[-1]
-            pred = ZonePrediction(
-                section_index=max_pairs,
-                estimated_count=extra.running_count * retention,
-                estimated_cards=extra.size,
-                source_zones=[extra.index],
-                confidence=retention * 0.7,  # lower confidence for unmixed zone
-            )
-            predictions.append(pred)
-        elif len(bottom_half) > len(top_half):
-            extra = bottom_half[-1]
-            pred = ZonePrediction(
-                section_index=max_pairs,
-                estimated_count=extra.running_count * retention,
-                estimated_cards=extra.size,
-                source_zones=[extra.index],
-                confidence=retention * 0.7,
-            )
-            predictions.append(pred)
+            if not right_zones:
+                # ── Solo group: no riffle partner → full retention ──
+                for z in left_zones:
+                    pred = ZonePrediction(
+                        section_index=section_idx,
+                        estimated_count=float(z.running_count),
+                        estimated_cards=z.size,
+                        source_zones=[z.index],
+                        confidence=1.0,
+                        riffled=False,
+                    )
+                    predictions.append(pred)
+                    section_idx += 1
+                continue
+
+            # ── Riffled pair: interleave left and right zones ──
+            # Model: corresponding zones from left & right stacks merge.
+            # Any leftover zones in the longer stack are partially mixed
+            # (they get shuffled into the tail of the shorter stack's last zone).
+            max_pairs = min(len(left_zones), len(right_zones))
+
+            for i in range(max_pairs):
+                lz = left_zones[i]
+                rz = right_zones[i]
+
+                combined_rc = lz.running_count + rz.running_count
+                combined_size = lz.size + rz.size
+                effective_rc = combined_rc * retention
+
+                pred = ZonePrediction(
+                    section_index=section_idx,
+                    estimated_count=effective_rc,
+                    estimated_cards=combined_size,
+                    source_zones=[lz.index, rz.index],
+                    confidence=retention,
+                    riffled=True,
+                )
+                predictions.append(pred)
+                section_idx += 1
+
+            # Leftover zones from the longer stack
+            longer = (left_zones[max_pairs:] if len(left_zones) > max_pairs
+                      else right_zones[max_pairs:])
+            for z in longer:
+                # Partially mixed with the tail of the riffle
+                effective_rc = z.running_count * retention
+                pred = ZonePrediction(
+                    section_index=section_idx,
+                    estimated_count=effective_rc,
+                    estimated_cards=z.size,
+                    source_zones=[z.index],
+                    confidence=retention * 0.8,
+                    riffled=True,
+                )
+                predictions.append(pred)
+                section_idx += 1
 
         self.post_shuffle_predictions = predictions
         return predictions
@@ -322,6 +403,7 @@ class ZonePrediction:
     estimated_cards: int        # approximate cards in this section
     source_zones: list[int]     # which original zones contributed
     confidence: float           # 0.0 to 1.0
+    riffled: bool = True        # False = this zone was never riffled (full retention)
 
     @property
     def is_favorable(self) -> bool:
@@ -344,10 +426,11 @@ class ZonePrediction:
             signal = "- Unfavorable"
         else:
             signal = "  Neutral"
+        riffle_tag = "" if self.riffled else " [NOT RIFFLED]"
         return (
             f"Section {self.section_index}: "
             f"est.count={ec:+.1f} | "
             f"~{self.estimated_cards} cards | "
             f"conf={self.confidence:.0%} | "
-            f"{signal}"
+            f"{signal}{riffle_tag}"
         )

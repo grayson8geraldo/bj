@@ -471,18 +471,44 @@ def main():
                     print(f"    {DIM}{line}{RESET}")
 
             # Get shuffle parameters
-            riffles_str = prompt("How many riffles did the dealer do? (default 2): ")
-            num_riffles = int(riffles_str) if riffles_str else 2
-            quality_str = prompt("Shuffle quality? sloppy/average/good (default average): ")
+            nz = tracker.num_zones
+            print(f"\n  {DIM}Tracked {nz} zones ({tracker.total_cards} cards).{RESET}")
+
+            stacks_str = prompt(
+                f"How many stacks did the dealer split into? (2/3/4, default 2): "
+            )
+            num_stacks = int(stacks_str) if stacks_str.strip() else 2
+            num_stacks = max(2, min(num_stacks, 4))
+
+            riffles_str = prompt("Riffles per pair? (default 2): ")
+            num_riffles = int(riffles_str) if riffles_str.strip() else 2
+
+            quality_str = prompt("Riffle quality? sloppy/average/good (default sloppy): ")
             quality_map = {"sloppy": 0.3, "s": 0.3, "average": 0.5, "a": 0.5,
                            "good": 0.7, "g": 0.7}
-            riffle_quality = quality_map.get(quality_str.lower(), 0.5)
+            riffle_quality = quality_map.get(quality_str.lower().strip(), 0.3)
 
-            preds = tracker.predict_simple(num_riffles, riffle_quality)
+            strip_str = prompt("Did the dealer do a strip cut? y/n (default y): ")
+            has_strip = strip_str.lower().strip() not in ("n", "no")
 
+            preds = tracker.predict_multistack(
+                num_stacks=num_stacks,
+                riffles_per_pair=num_riffles,
+                riffle_quality=riffle_quality,
+                has_strip=has_strip,
+            )
+
+            eff_quality = min(riffle_quality + (0.1 if has_strip else 0), 1.0)
+            retention = (1 - eff_quality) ** num_riffles
             print(f"\n  {BOLD}{MAGENTA}Predictions for NEXT shoe:{RESET}")
-            print(f"  {DIM}(riffles={num_riffles}, quality={riffle_quality:.1f}, "
-                  f"retention={((1-riffle_quality)**num_riffles):.0%}){RESET}")
+            print(f"  {DIM}(stacks={num_stacks}, riffles={num_riffles}/pair, "
+                  f"quality={riffle_quality:.1f}"
+                  f"{'+strip' if has_strip else ''}, "
+                  f"retention={retention:.0%}){RESET}")
+            un_riffled = sum(1 for p in preds if not p.riffled)
+            if un_riffled:
+                print(f"  {GREEN}{BOLD}{un_riffled} section(s) NEVER RIFFLED "
+                      f"— full count retention!{RESET}")
             for p in preds:
                 if p.is_favorable:
                     print(f"    {GREEN}{BOLD}{p.summary()}{RESET}")

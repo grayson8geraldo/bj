@@ -1,0 +1,9 @@
+[project]
+name = "blackjack-advisor"
+version = "1.0.0"
+description = "Advanced blackjack advisor for live dealer games (8-deck, S17)"
+requires-python = ">=3.9"
+
+[project.scripts]
+bj = "blackjack.cli:main"
+bj-sim = "blackjack.simulator:main"

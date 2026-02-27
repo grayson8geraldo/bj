@@ -162,12 +162,16 @@ def api_new_hand():
     if not player_cards or not dealer_up:
         return jsonify({"error": "Need player_cards and dealer_up"}), 400
 
+    other_cards = data.get("other_cards", [])
+
     s["player_cards"] = player_cards
     s["dealer_up"] = dealer_up
     s["in_hand"] = True
 
     track_cards(s, player_cards)
     track_card(s, dealer_up)
+    if other_cards:
+        track_cards(s, other_cards)
 
     tc = s["counter"].tc
     result = {"sid": sid}

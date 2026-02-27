@@ -159,6 +159,37 @@ body {
 .btn-warn { background: var(--yellow); color: #000; }
 .btn:disabled { opacity: 0.3; }
 
+/* ── Seat rows ── */
+.seat-row {
+  display: flex; gap: 8px; align-items: center;
+  padding: 6px 8px; border-radius: 6px;
+  cursor: pointer; transition: background 0.15s;
+  min-height: 32px;
+}
+.seat-row:active { background: rgba(88, 166, 255, 0.08); }
+.seat-row.active { background: rgba(88, 166, 255, 0.12); }
+.seat-indicator {
+  width: 14px; font-size: 12px; color: var(--blue);
+  flex-shrink: 0; text-align: center;
+}
+.seat-label {
+  font-size: 12px; color: var(--dim); width: 75px; flex-shrink: 0;
+}
+.seat-row.my-seat .seat-label { color: var(--cyan); font-weight: 700; }
+.seat-cards {
+  flex: 1; font-size: 16px; font-weight: 600; color: var(--text);
+  min-height: 20px;
+}
+.seat-row.my-seat .seat-cards { color: var(--cyan); }
+.seat-clear {
+  flex: 0; padding: 4px 8px; font-size: 11px;
+  background: var(--border); border: none; border-radius: 4px;
+  color: var(--dim); cursor: pointer;
+}
+.seat-clear:active { background: var(--blue); color: #fff; }
+.dealer-row .seat-label { color: var(--yellow); }
+.dealer-row .seat-cards { color: var(--yellow); }
+
 /* ── Log ── */
 .log {
   padding: 8px 12px;
@@ -310,20 +341,12 @@ body {
 
 <!-- ═══════ HAND MODE ═══════ -->
 <div class="section mode-panel" id="mode-hand">
-  <div class="input-row">
-    <span class="input-label">Игрок:</span>
-    <span class="selected-cards" id="player-display">—</span>
-    <button class="btn btn-secondary" style="flex:0;padding:8px 12px;font-size:12px" onclick="clearPlayerCards()">C</button>
-  </div>
-  <div class="input-row">
-    <span class="input-label">Дилер:</span>
-    <span class="selected-cards" id="dealer-display">—</span>
-    <button class="btn btn-secondary" style="flex:0;padding:8px 12px;font-size:12px" onclick="clearDealerCard()">C</button>
-  </div>
+  <div id="seats-container"></div>
   <div class="card-grid" id="hand-card-grid"></div>
   <div class="btn-row">
     <button class="btn btn-primary" id="btn-deal" onclick="dealHand()">Раздача</button>
     <button class="btn btn-warn" id="btn-hit" onclick="hitCard()" disabled>Хит</button>
+    <button class="btn btn-secondary" onclick="clearAllSeats()" style="flex:0;padding:12px 14px;font-size:12px">C</button>
   </div>
 </div>
 
@@ -447,6 +470,24 @@ body {
       <label>Макс. ставка ($)</label>
       <input type="number" id="setup-max" value="500">
     </div>
+    <div class="modal-field">
+      <label>Игроков за столом (включая тебя)</label>
+      <select id="setup-seats" onchange="updateSeatOptions()">
+        <option value="1" selected>1 (только я)</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+        <option value="6">6</option>
+        <option value="7">7</option>
+      </select>
+    </div>
+    <div class="modal-field" id="my-seat-field" style="display:none">
+      <label>Моё место (бокс)</label>
+      <select id="setup-my-seat">
+        <option value="1">1</option>
+      </select>
+    </div>
     <div class="btn-row">
       <button class="btn btn-success" onclick="initSession()" style="font-size:18px;padding:16px">Начать</button>
     </div>
@@ -457,13 +498,16 @@ body {
 // ── State ──
 let SID = null;
 const CARDS = ['2','3','4','5','6','7','8','9','T','J','Q','K','A'];
-const CARD_MAP = {'T':'10','J':'J','Q':'Q','K':'K'};
 let currentMode = 'hand';
-let playerCards = [];
-let dealerCard = null;
 let countCards = [];
-let handInputPhase = 'player'; // 'player' or 'dealer'
 let hitMode = false;
+
+// ── Multi-seat state ──
+let numSeats = 1;
+let mySeat = 1;
+let seatCards = {};   // {1: ['8','Q'], 2: ['A','5'], ...}
+let dealerCard = null;
+let activeSeatIndex = 1;  // 1..numSeats or 'dealer'
 
 // ── API helper ──
 async function api(endpoint, method='GET', body=null) {
@@ -475,17 +519,128 @@ async function api(endpoint, method='GET', body=null) {
   return r.json();
 }
 
+// ── Setup modal: update my-seat options ──
+function updateSeatOptions() {
+  const n = +document.getElementById('setup-seats').value;
+  const sel = document.getElementById('setup-my-seat');
+  const current = +sel.value;
+  sel.innerHTML = '';
+  for (let i = 1; i <= n; i++) {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = 'Бокс ' + i;
+    sel.appendChild(opt);
+  }
+  sel.value = Math.min(current, n);
+  document.getElementById('my-seat-field').style.display = n > 1 ? '' : 'none';
+}
+
 // ── Init ──
 async function initSession() {
   const bankroll = +document.getElementById('setup-bankroll').value || 1000;
   const min_bet = +document.getElementById('setup-min').value || 10;
   const max_bet = +document.getElementById('setup-max').value || 500;
+  numSeats = +document.getElementById('setup-seats').value || 1;
+  mySeat = numSeats > 1 ? (+document.getElementById('setup-my-seat').value || 1) : 1;
+
   const data = await api('init', 'POST', {bankroll, min_bet, max_bet});
   SID = data.sid;
   updateUI(data.state);
   document.getElementById('setup-modal').classList.remove('open');
-  log('Сессия начата. Банкролл $' + bankroll);
+  log('Сессия начата. Банкролл $' + bankroll +
+      (numSeats > 1 ? ' | ' + numSeats + ' игроков, твой бокс ' + mySeat : ''));
+  initSeats();
   buildCardGrids();
+}
+
+// ── Seat management ──
+function initSeats() {
+  seatCards = {};
+  for (let i = 1; i <= numSeats; i++) {
+    seatCards[i] = [];
+  }
+  dealerCard = null;
+  activeSeatIndex = 1;
+  hitMode = false;
+  buildSeatsUI();
+}
+
+function buildSeatsUI() {
+  const container = document.getElementById('seats-container');
+  let html = '';
+  for (let i = 1; i <= numSeats; i++) {
+    const isActive = activeSeatIndex === i && !hitMode;
+    const isMine = i === mySeat;
+    const cards = seatCards[i] || [];
+    const label = numSeats === 1 ? 'Игрок' : ('Бокс ' + i + (isMine ? ' ★' : ''));
+    html += '<div class="seat-row' + (isActive ? ' active' : '') + (isMine ? ' my-seat' : '') + '"'
+         + ' onclick="selectSeat(' + i + ')">'
+         + '<span class="seat-indicator">' + (isActive ? '→' : '') + '</span>'
+         + '<span class="seat-label">' + label + '</span>'
+         + '<span class="seat-cards">' + (cards.join(' ') || '—') + '</span>'
+         + '<button class="seat-clear" onclick="event.stopPropagation();clearSeat(' + i + ')">C</button>'
+         + '</div>';
+  }
+  // Dealer row
+  const dealerActive = activeSeatIndex === 'dealer' && !hitMode;
+  html += '<div class="seat-row dealer-row' + (dealerActive ? ' active' : '') + '"'
+       + ' onclick="selectSeat(\'dealer\')">'
+       + '<span class="seat-indicator">' + (dealerActive ? '→' : '') + '</span>'
+       + '<span class="seat-label">Дилер</span>'
+       + '<span class="seat-cards">' + (dealerCard || '—') + '</span>'
+       + '<button class="seat-clear" onclick="event.stopPropagation();clearDealer()">C</button>'
+       + '</div>';
+
+  // Hit mode indicator
+  if (hitMode) {
+    const myCards = seatCards[mySeat] || [];
+    html += '<div style="text-align:center;padding:4px;font-size:11px;color:var(--blue)">'
+         + 'Хит → Бокс ' + mySeat + ' (' + myCards.join(' ') + ')</div>';
+  }
+
+  container.innerHTML = html;
+}
+
+function selectSeat(idx) {
+  if (hitMode) return; // during hit, input goes to my seat only
+  activeSeatIndex = idx;
+  buildSeatsUI();
+}
+
+function clearSeat(idx) {
+  seatCards[idx] = [];
+  activeSeatIndex = idx;
+  buildSeatsUI();
+}
+
+function clearDealer() {
+  dealerCard = null;
+  activeSeatIndex = 'dealer';
+  buildSeatsUI();
+}
+
+function clearAllSeats() {
+  for (let i = 1; i <= numSeats; i++) {
+    seatCards[i] = [];
+  }
+  dealerCard = null;
+  activeSeatIndex = 1;
+  hitMode = false;
+  document.getElementById('btn-hit').disabled = true;
+  document.getElementById('btn-deal').disabled = false;
+  buildSeatsUI();
+}
+
+function advanceToNextSeat() {
+  if (typeof activeSeatIndex === 'number') {
+    const next = activeSeatIndex + 1;
+    if (next <= numSeats) {
+      activeSeatIndex = next;
+    } else {
+      activeSeatIndex = 'dealer';
+    }
+  }
+  // If dealer card is already set, don't advance
 }
 
 // ── Card grids ──
@@ -516,45 +671,22 @@ function onCardTap(card, gridId) {
       doHit(rank);
       return;
     }
-    if (handInputPhase === 'player') {
-      playerCards.push(rank);
-      updateHandDisplay();
-      if (playerCards.length >= 2) {
-        handInputPhase = 'dealer';
-      }
-    } else {
+    if (activeSeatIndex === 'dealer') {
       dealerCard = rank;
-      updateHandDisplay();
+      // Don't auto-advance from dealer
+      buildSeatsUI();
+    } else {
+      seatCards[activeSeatIndex].push(rank);
+      // Auto-advance after 2 cards
+      if (seatCards[activeSeatIndex].length >= 2) {
+        advanceToNextSeat();
+      }
+      buildSeatsUI();
     }
   } else {
     countCards.push(rank);
     document.getElementById('count-display').textContent = countCards.join(' ') || '—';
   }
-}
-
-function updateHandDisplay() {
-  document.getElementById('player-display').textContent = playerCards.join(' ') || '—';
-  document.getElementById('dealer-display').textContent = dealerCard || '—';
-  // Highlight active input
-  document.querySelector('#mode-hand .input-label').style.color =
-    handInputPhase === 'player' ? 'var(--cyan)' : 'var(--dim)';
-  document.querySelectorAll('#mode-hand .input-label')[1].style.color =
-    handInputPhase === 'dealer' ? 'var(--cyan)' : 'var(--dim)';
-}
-
-function clearPlayerCards() {
-  playerCards = [];
-  handInputPhase = 'player';
-  hitMode = false;
-  document.getElementById('btn-hit').disabled = true;
-  document.getElementById('btn-deal').disabled = false;
-  updateHandDisplay();
-}
-
-function clearDealerCard() {
-  dealerCard = null;
-  handInputPhase = 'dealer';
-  updateHandDisplay();
 }
 
 function clearCountCards() {
@@ -564,13 +696,24 @@ function clearCountCards() {
 
 // ── Deal ──
 async function dealHand() {
-  if (playerCards.length < 2 || !dealerCard) {
-    log('Нужно минимум 2 карты игрока + дилер', 'alert');
+  const myCards = seatCards[mySeat] || [];
+  if (myCards.length < 2 || !dealerCard) {
+    log('Нужно минимум 2 карты на твоём боксе + дилер', 'alert');
     return;
   }
+
+  // Collect other players' cards
+  let otherCards = [];
+  for (let i = 1; i <= numSeats; i++) {
+    if (i !== mySeat && seatCards[i].length > 0) {
+      otherCards = otherCards.concat(seatCards[i]);
+    }
+  }
+
   const data = await api('new_hand', 'POST', {
-    player_cards: playerCards,
+    player_cards: myCards,
     dealer_up: dealerCard,
+    other_cards: otherCards,
   });
   if (data.error) { log(data.error, 'bad'); return; }
 
@@ -596,18 +739,24 @@ async function dealHand() {
     log('Девиация! Базовая стратегия: ' + data.basic_would_be, 'alert');
   }
 
-  log('Рука: ' + playerCards.join(' ') + ' vs ' + dealerCard +
-      ' → ' + data.action_name);
+  const logParts = ['Рука: ' + myCards.join(' ') + ' vs ' + dealerCard + ' → ' + data.action_name];
+  if (otherCards.length > 0) {
+    logParts.push('(+' + otherCards.length + ' карт со стола)');
+  }
+  log(logParts.join(' '));
 
   hitMode = true;
+  activeSeatIndex = mySeat;
   document.getElementById('btn-hit').disabled = false;
   document.getElementById('btn-deal').disabled = true;
+  buildSeatsUI();
 }
 
 // ── Hit ──
 async function hitCard() {
-  // Switch to hit mode — next card tap will call doHit
   hitMode = true;
+  activeSeatIndex = mySeat;
+  buildSeatsUI();
   showAction('Нажми карту...', 'Хит', 'action-hit');
 }
 
@@ -615,8 +764,8 @@ async function doHit(rank) {
   const data = await api('hit', 'POST', {card: rank});
   if (data.error) { log(data.error, 'bad'); return; }
 
-  playerCards.push(rank);
-  updateHandDisplay();
+  seatCards[mySeat].push(rank);
+  buildSeatsUI();
   updateUI(data.state);
 
   if (data.bust) {
@@ -624,6 +773,7 @@ async function doHit(rank) {
     log('Бaст: ' + data.hand_value, 'bad');
     hitMode = false;
     document.getElementById('btn-hit').disabled = true;
+    buildSeatsUI();
     return;
   }
   if (data.twenty_one) {
@@ -631,6 +781,7 @@ async function doHit(rank) {
     log('21!', 'good');
     hitMode = false;
     document.getElementById('btn-hit').disabled = true;
+    buildSeatsUI();
     return;
   }
 
@@ -662,8 +813,7 @@ async function submitResult(type) {
   updateUI(data.state);
   const cls = amount > 0 ? 'good' : amount < 0 ? 'bad' : '';
   log('Результат: $' + (amount > 0 ? '+' : '') + amount, cls);
-  clearPlayerCards();
-  hitMode = false;
+  clearAllSeats();
   updateStats(data.state);
 }
 
@@ -675,8 +825,7 @@ async function submitResultCustom() {
   const cls = amount > 0 ? 'good' : amount < 0 ? 'bad' : '';
   log('Результат: $' + (amount > 0 ? '+' : '') + amount, cls);
   el.value = '';
-  clearPlayerCards();
-  hitMode = false;
+  clearAllSeats();
   updateStats(data.state);
 }
 
@@ -685,8 +834,7 @@ async function resetShoe() {
   const data = await api('shoe_reset', 'POST', {});
   updateUI(data.state);
   log('Новый шуз', 'important');
-  clearPlayerCards();
-  hitMode = false;
+  clearAllSeats();
 }
 
 // ── Zones ──
@@ -739,8 +887,7 @@ async function submitShuffle() {
   const noriff = data.predictions.filter(p => !p.riffled).length;
   if (noriff) log(noriff + ' секций НЕ рифлились — 100% retention!', 'good');
 
-  clearPlayerCards();
-  hitMode = false;
+  clearAllSeats();
   setMode('shuffle');
 }
 
@@ -886,7 +1033,6 @@ function log(msg, cls) {
   const time = new Date().toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
   entry.textContent = time + '  ' + msg;
   el.prepend(entry);
-  // Keep max 50 entries
   while (el.children.length > 50) el.lastChild.remove();
 }
 
@@ -902,8 +1048,9 @@ document.addEventListener('keydown', e => {
   }
 });
 
-// Build grids on load (in case session exists)
+// Build grids and default seats on load
 buildCardGrids();
+initSeats();
 </script>
 </body>
 </html>

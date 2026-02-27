@@ -14,6 +14,7 @@ from .strategy import (
     get_action, should_take_insurance, ACTION_NAMES, basic_strategy
 )
 from .betting import BetAdvisor, player_edge, wonging_signal
+from .shuffle_tracking import ShuffleTracker
 
 
 # ─── ANSI colors ─────────────────────────────────────────
@@ -101,12 +102,20 @@ def print_help():
   {CYAN}c/count{RESET}    — Enter cards seen (burned, other players' cards, etc.)
   {CYAN}h/hit{RESET}      — Player took a hit (enter the new card)
   {CYAN}r/result{RESET}   — Record hand result (win/loss/push amount)
+  {CYAN}d/dealer{RESET}   — Count dealer's revealed cards
   {CYAN}s/status{RESET}   — Show current count and session stats
   {CYAN}shoe{RESET}       — Reset shoe (new shuffle)
   {CYAN}b/bet{RESET}      — Show recommended bet
   {CYAN}w/wong{RESET}     — Wong in/out signal
   {CYAN}i/insurance{RESET}— Should I take insurance?
   {CYAN}stats{RESET}      — Detailed session statistics
+
+{BOLD}Shuffle Tracking (hand-shuffle riffle):{RESET}
+  {MAGENTA}zones{RESET}      — Show zone breakdown of current shoe
+  {MAGENTA}shuffle{RESET}    — Shoe finished, analyze zones & predict next shoe
+  {MAGENTA}predict{RESET}    — Show predictions for the current (post-shuffle) shoe
+  {MAGENTA}section{RESET}    — Mark that we've moved to the next section of the shoe
+
   {CYAN}help{RESET}       — Show this help
   {CYAN}q/quit{RESET}     — Exit
 """)
@@ -141,13 +150,51 @@ def main():
 
     advisor = BetAdvisor(bankroll, min_bet, max_bet)
 
+    # Shuffle tracking
+    tracker = ShuffleTracker(num_decks=num_decks, cards_per_zone=52)
+    predictions_active = False   # True after 'shuffle' command generated predictions
+    current_section = 0          # Which predicted section we're in
+    cards_in_section = 0         # Cards dealt in current section
+
     print(f"\n{GREEN}Ready! Type 'help' for commands.{RESET}")
     print(f"{DIM}Shoe: {num_decks} decks | Bankroll: ${bankroll:,.0f} | "
-          f"Spread: 1-{advisor.spread:.0f}{RESET}\n")
+          f"Spread: 1-{advisor.spread:.0f}{RESET}")
+    print(f"{DIM}Shuffle tracking: ON (zones of ~52 cards){RESET}\n")
 
     current_player_cards: list[str] = []
     current_dealer_up: str = ""
     in_hand = False
+
+    def track_cards(cards: list[str]):
+        """Feed cards to both counter and shuffle tracker."""
+        nonlocal cards_in_section
+        counter.count_cards(cards)
+        tracker.add_cards(cards)
+        if predictions_active:
+            cards_in_section += len(cards)
+
+    def track_card(card: str):
+        """Feed one card to both counter and shuffle tracker."""
+        nonlocal cards_in_section
+        counter.count_card(card)
+        tracker.add_card(card)
+        if predictions_active:
+            cards_in_section += 1
+
+    def show_section_signal():
+        """Show shuffle tracking bet signal for current section."""
+        if not predictions_active:
+            return
+        signal = tracker.get_bet_signal_for_section(current_section)
+        preds = tracker.post_shuffle_predictions
+        if current_section < len(preds):
+            pred = preds[current_section]
+            if signal == "big":
+                print(f"  {GREEN}{BOLD}[SHUFFLE TRACK] TEN-RICH zone — BET BIG{RESET}"
+                      f" {DIM}(est.count={pred.estimated_count:+.1f}){RESET}")
+            elif signal == "min":
+                print(f"  {RED}[SHUFFLE TRACK] ten-poor zone — bet minimum{RESET}"
+                      f" {DIM}(est.count={pred.estimated_count:+.1f}){RESET}")
 
     while True:
         # Show count in prompt
@@ -194,8 +241,8 @@ def main():
             in_hand = True
 
             # Count all visible cards
-            counter.count_cards(player)
-            counter.count_card(dealer)
+            track_cards(player)
+            track_card(dealer)
 
             # Update TC after counting
             tc = counter.tc
@@ -240,6 +287,9 @@ def main():
                 bs = basic_strategy(player, dealer, can_double, can_surrender, can_split)
                 print(f"  {DIM}(Basic strategy would be: {ACTION_NAMES.get(bs, bs)}){RESET}")
 
+            # Shuffle tracking signal
+            show_section_signal()
+
             print()
 
         # ── Hit (new card drawn) ──
@@ -255,7 +305,7 @@ def main():
                 continue
 
             current_player_cards.append(card)
-            counter.count_card(card)
+            track_card(card)
             tc = counter.tc
 
             val = hand_value(current_player_cards)
@@ -290,7 +340,7 @@ def main():
             if cards is None:
                 print(f"{RED}Invalid cards.{RESET}")
                 continue
-            counter.count_cards(cards)
+            track_cards(cards)
             print(f"  {DIM}Counted {len(cards)} cards.{RESET}")
 
         # ── Record result ──
@@ -318,7 +368,7 @@ def main():
             if cards is None:
                 print(f"{RED}Invalid cards.{RESET}")
                 continue
-            counter.count_cards(cards)
+            track_cards(cards)
             print(f"  {DIM}Counted dealer cards.{RESET}")
 
         # ── Status ──
@@ -375,11 +425,130 @@ def main():
             else:
                 print(f"\n  {RED}NO — Skip Insurance (TC={tc:+.1f} < +3){RESET}\n")
 
-        # ── New shoe ──
+        # ── New shoe (simple reset, no shuffle analysis) ──
         elif cmd_lower == "shoe":
             counter.reset()
+            tracker.reset()
+            predictions_active = False
+            current_section = 0
+            cards_in_section = 0
             in_hand = False
-            print(f"\n  {CYAN}Shoe reset — new shuffle.{RESET}\n")
+            print(f"\n  {CYAN}Shoe reset — new shuffle (no tracking).{RESET}\n")
+
+        # ── Zones: show zone breakdown ──
+        elif cmd_lower == "zones":
+            lines = tracker.get_zone_summary()
+            if not lines:
+                print(f"  {DIM}No zones yet — play some hands first.{RESET}")
+            else:
+                print(f"\n  {BOLD}Zone Breakdown (current shoe):{RESET}")
+                for line in lines:
+                    # Colorize based on content
+                    if "TEN-RICH" in line:
+                        print(f"    {GREEN}{line}{RESET}")
+                    elif "ten-poor" in line:
+                        print(f"    {RED}{line}{RESET}")
+                    else:
+                        print(f"    {DIM}{line}{RESET}")
+                print(f"    {DIM}Total: {tracker.total_cards} cards in {tracker.num_zones} zones{RESET}")
+            print()
+
+        # ── Shuffle: analyze zones and predict next shoe ──
+        elif cmd_lower == "shuffle":
+            tracker.finalize_shoe()
+            lines = tracker.get_zone_summary()
+            if not lines:
+                print(f"  {RED}No card data — track cards first.{RESET}")
+                continue
+
+            print(f"\n  {BOLD}Shoe Finished — Zone Analysis:{RESET}")
+            for line in lines:
+                if "TEN-RICH" in line:
+                    print(f"    {GREEN}{line}{RESET}")
+                elif "ten-poor" in line:
+                    print(f"    {RED}{line}{RESET}")
+                else:
+                    print(f"    {DIM}{line}{RESET}")
+
+            # Get shuffle parameters
+            riffles_str = prompt("How many riffles did the dealer do? (default 2): ")
+            num_riffles = int(riffles_str) if riffles_str else 2
+            quality_str = prompt("Shuffle quality? sloppy/average/good (default average): ")
+            quality_map = {"sloppy": 0.3, "s": 0.3, "average": 0.5, "a": 0.5,
+                           "good": 0.7, "g": 0.7}
+            riffle_quality = quality_map.get(quality_str.lower(), 0.5)
+
+            preds = tracker.predict_simple(num_riffles, riffle_quality)
+
+            print(f"\n  {BOLD}{MAGENTA}Predictions for NEXT shoe:{RESET}")
+            print(f"  {DIM}(riffles={num_riffles}, quality={riffle_quality:.1f}, "
+                  f"retention={((1-riffle_quality)**num_riffles):.0%}){RESET}")
+            for p in preds:
+                if p.is_favorable:
+                    print(f"    {GREEN}{BOLD}{p.summary()}{RESET}")
+                elif p.is_unfavorable:
+                    print(f"    {RED}{p.summary()}{RESET}")
+                else:
+                    print(f"    {DIM}{p.summary()}{RESET}")
+
+            # Reset counter for new shoe but keep predictions
+            counter.reset()
+            new_tracker = ShuffleTracker(num_decks=num_decks, cards_per_zone=52)
+            # Transfer predictions to new tracker
+            new_tracker.post_shuffle_predictions = preds
+            tracker = new_tracker
+            predictions_active = True
+            current_section = 0
+            cards_in_section = 0
+            in_hand = False
+
+            print(f"\n  {GREEN}Counter reset for new shoe. Predictions active!{RESET}")
+            print(f"  {DIM}Use 'section' when ~{preds[0].estimated_cards if preds else 52} cards dealt "
+                  f"to advance to next section.{RESET}")
+            print(f"  {DIM}Use 'predict' to review predictions anytime.{RESET}\n")
+
+        # ── Predict: show current predictions ──
+        elif cmd_lower == "predict":
+            if not predictions_active or not tracker.post_shuffle_predictions:
+                print(f"  {DIM}No predictions — use 'shuffle' after a shoe to generate them.{RESET}")
+            else:
+                preds = tracker.post_shuffle_predictions
+                print(f"\n  {BOLD}Post-Shuffle Predictions:{RESET}")
+                for p in preds:
+                    marker = " <<<" if p.section_index == current_section else ""
+                    if p.is_favorable:
+                        print(f"    {GREEN}{BOLD}{p.summary()}{marker}{RESET}")
+                    elif p.is_unfavorable:
+                        print(f"    {RED}{p.summary()}{marker}{RESET}")
+                    else:
+                        print(f"    {DIM}{p.summary()}{marker}{RESET}")
+                print(f"  {DIM}Currently in section {current_section} "
+                      f"({cards_in_section} cards dealt){RESET}")
+            print()
+
+        # ── Section: advance to next predicted section ──
+        elif cmd_lower == "section":
+            if not predictions_active:
+                print(f"  {DIM}No predictions active.{RESET}")
+            else:
+                current_section += 1
+                cards_in_section = 0
+                preds = tracker.post_shuffle_predictions
+                if current_section < len(preds):
+                    p = preds[current_section]
+                    signal = tracker.get_bet_signal_for_section(current_section)
+                    if signal == "big":
+                        print(f"\n  {GREEN}{BOLD}Section {current_section}: "
+                              f"TEN-RICH — BET BIG!{RESET}")
+                    elif signal == "min":
+                        print(f"\n  {RED}Section {current_section}: "
+                              f"ten-poor — bet minimum{RESET}")
+                    else:
+                        print(f"\n  {DIM}Section {current_section}: neutral{RESET}")
+                else:
+                    print(f"\n  {DIM}Past predicted sections — using count only.{RESET}")
+                    predictions_active = False
+            print()
 
         # ── Detailed stats ──
         elif cmd_lower == "stats":
@@ -415,7 +584,7 @@ def main():
             # Try to parse as cards to count
             cards = parse_cards(cmd)
             if cards is not None:
-                counter.count_cards(cards)
+                track_cards(cards)
                 tc = counter.tc
                 print(f"  {DIM}Counted: {' '.join(cards)} | "
                       f"RC={counter.rc:+d} TC={tc:+.1f}{RESET}")
